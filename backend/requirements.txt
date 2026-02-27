@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+sqlalchemy
+geoalchemy2
+psycopg2-binary
+langchain
+langchain-openai
+langchain-core
+python-dotenv
+starlette
+googlemaps
+httpx
+aiohttp
