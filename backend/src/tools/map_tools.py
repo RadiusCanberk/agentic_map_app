@@ -298,14 +298,25 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
             "Accept": "application/json"
         }
 
-        with httpx.Client(timeout=30000.0, headers=headers) as client:
+        # Timeout: 300 seconds (5 minutes) for Placemaking API polygon search
+        with httpx.Client(timeout=300.0, headers=headers) as client:
             resp = client.post(PLACEMAKING_API_URL, json=payload)
             resp.raise_for_status()
             data = resp.json()
 
-        results = data.get("result", {}).get("result", [])
+        # Handle nested response structure: {"result": {"is_success": bool, "result": [...]}}
+        result_wrapper = data.get("result", {})
+        if isinstance(result_wrapper, dict):
+            results = result_wrapper.get("result", [])
+        else:
+            results = result_wrapper if isinstance(result_wrapper, list) else []
+
         if not results:
             return "No places found within this polygon in the live data."
+
+        # Limit results to reduce token count in agent (avoid exceeding LLM context window)
+        # Keep top 100 places sorted by relevance (order from API)
+        results = results[:100]
 
         # Return the results as a JSON string so they can be processed by other tools
         return json.dumps(results)
@@ -313,9 +324,15 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
     except json.JSONDecodeError as e:
         return f"Error parsing polygon JSON: {str(e)}. Received data: {polygon_geojson[:200]}..."
     except httpx.HTTPStatusError as e:
-        return f"API request failed with status {e.response.status_code}: {e.response.text[:200]}"
+        try:
+            error_detail = e.response.json().get("message", e.response.text[:500])
+        except Exception:
+            error_detail = e.response.text[:500]
+        return f"Placemaking API error {e.response.status_code}: {error_detail}"
+    except httpx.TimeoutException as e:
+        return f"Request timeout after 300 seconds: {str(e)}"
     except httpx.RequestError as e:
-        return f"Request error: {str(e)}"
+        return f"Request error (network/connection issue): {str(e)}"
     except Exception as e:
         return f"Error searching in polygon: {str(e)}"
 
@@ -379,14 +396,14 @@ def filter_places_by_category(places_json: str, category_query: str) -> str:
             return f"No places found for category '{category_query}' in the provided list."
 
         output_lines = [f"Found {len(filtered_results)} places matching '{category_query}':\n"]
-        for i, place in enumerate(filtered_results[:30], 1): # Limit to 30 for response length
+        for i, place in enumerate(filtered_results[:50], 1): # Limit to 50 for response length
             name = place.get("name", "Unknown")
             lat = place.get("latitude")
             lon = place.get("longitude")
             address = place.get("street_address", "No address")
             category = place.get("business_category", "N/A")
             main_category = place.get("main_category", "N/A")
-            
+
             output_lines.append(
                 f"{i}. {name}\n"
                 f"   📍 Coordinates: {lat}, {lon}\n"
@@ -394,9 +411,9 @@ def filter_places_by_category(places_json: str, category_query: str) -> str:
                 f"   🧭 Business Category: {category}\n"
                 f"   🏷️ Main Category: {main_category}\n"
             )
-        
-        if len(filtered_results) > 30:
-            output_lines.append(f"\n... and {len(filtered_results) - 30} more places.")
+
+        if len(filtered_results) > 50:
+            output_lines.append(f"\n... and {len(filtered_results) - 50} more places.")
 
         return "\n".join(output_lines)
 
