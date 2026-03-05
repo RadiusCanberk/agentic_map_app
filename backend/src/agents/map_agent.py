@@ -11,14 +11,12 @@ from src.tools.map_tools import (
     get_area_polygon,
     get_country_for_area,
     search_places_in_polygon,
-    filter_places_by_category,
 )
 
 TOOLS = [
     get_area_polygon,
     get_country_for_area,
     search_places_in_polygon,
-    filter_places_by_category,
 ]
 
 
@@ -47,15 +45,10 @@ def create_map_agent(model_name: str):
 
 
 def _extract_places_from_tool_json(messages: list) -> list[dict]:
-    """
-    Extracts places from ToolMessage JSON outputs (search_places_in_polygon, filter_places_by_category).
-    Prioritizes filtered results (from filter_places_by_category) over raw results (from search_places_in_polygon).
-    """
+    """Extracts places from search_places_in_polygon JSON output."""
     places = []
     seen = set()
 
-    # Collect all JSON arrays from tool messages
-    json_arrays = []
     for msg in messages:
         # Only process ToolMessage (tool outputs)
         if type(msg).__name__ != "ToolMessage":
@@ -75,34 +68,22 @@ def _extract_places_from_tool_json(messages: list) -> list[dict]:
             continue
 
         try:
-            # Extract JSON from content start until we find a non-JSON character
-            # This handles cases where JSON is followed by text
-            json_str = content.strip()
-            # Find where valid JSON ends (look for closing bracket followed by non-whitespace)
-            for i in range(len(json_str), 0, -1):
-                try:
-                    data = json.loads(json_str[:i])
-                    if isinstance(data, list) and len(data) > 0:
-                        json_arrays.append(data)
-                    break
-                except json.JSONDecodeError:
-                    continue
+            # Parse JSON array
+            data = json.loads(content)
+
+            # Handle list of places
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        place = _extract_place_from_item(item)
+                        if place:
+                            key = (round(place["lat"], 4), round(place["lon"], 4))
+                            if key not in seen:
+                                seen.add(key)
+                                places.append(place)
         except (json.JSONDecodeError, ValueError):
             # Not valid JSON array, skip silently
             pass
-
-    # If we have multiple JSON arrays, use the last one (from filter_places_by_category)
-    # Otherwise, use the first one (from search_places_in_polygon)
-    if json_arrays:
-        data = json_arrays[-1] if len(json_arrays) > 1 else json_arrays[0]
-        for item in data:
-            if isinstance(item, dict):
-                place = _extract_place_from_item(item)
-                if place:
-                    key = (round(place["lat"], 4), round(place["lon"], 4))
-                    if key not in seen:
-                        seen.add(key)
-                        places.append(place)
 
     return places
 
