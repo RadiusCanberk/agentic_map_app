@@ -147,6 +147,15 @@ _CATEGORY_SYNONYMS = {
     "gym": ["gym", "fitness", "sports", "workout", "club", "spor", "salon", "antrenman"],
     "school": ["school", "university", "college", "education", "academy", "okul", "üniversite", "eğitim"],
     "park": ["park", "garden", "recreation", "nature", "outdoor", "bahçe", "doğa"],
+    # Food/cuisine specific synonyms for better filtering of specific restaurant types
+    "burger": ["burger", "hamburger", "fast food", "fast_food", "burger joint", "burger bar"],
+    "pizza": ["pizza", "pizzeria", "italian"],
+    "kebab": ["kebab", "doner", "döner", "shawarma", "turkish grill"],
+    "sushi": ["sushi", "japanese", "ramen", "asian"],
+    "steak": ["steak", "steakhouse", "grill", "bbq", "barbecue"],
+    "seafood": ["seafood", "fish", "balık", "deniz ürünleri"],
+    "vegan": ["vegan", "vegetarian", "plant-based"],
+    "bakery": ["bakery", "pastry", "bread", "fırın", "pastane"],
 }
 
 
@@ -341,9 +350,11 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
 def filter_places_by_category(places_json: str, category_query: str) -> str:
     """
     Filters a list of places by business_category or main_category based on a category query.
+    Supports multi-word queries and specific cuisine types (e.g., 'burger restaurants', 'pizza places').
+
     Args:
         places_json: JSON string containing the list of places to filter.
-        category_query: The category to search for (e.g., 'restaurant', 'cafe', 'market').
+        category_query: The category to search for (e.g., 'restaurant', 'burger restaurants', 'pizza', 'cafe').
     """
     try:
         results = json.loads(places_json)
@@ -351,49 +362,71 @@ def filter_places_by_category(places_json: str, category_query: str) -> str:
             return "Invalid places data provided."
 
         cat_lower = category_query.lower()
-        
-        # Identify search terms (original + translated + synonyms)
-        search_terms = {cat_lower}
-        
-        # Add translation if it's Turkish
-        translated = _translate_query(cat_lower)
-        if translated != cat_lower:
-            search_terms.add(translated.lower())
-            
-        # Add synonyms if any search term matches a key in _CATEGORY_SYNONYMS
-        extra_terms = set()
-        for term in search_terms:
-            for key, synonyms in _CATEGORY_SYNONYMS.items():
-                if term == key or term in synonyms:
-                    extra_terms.update(synonyms)
-        search_terms.update(extra_terms)
 
+        # Tokenize query into individual words
+        tokens = cat_lower.split()
+        if not tokens:
+            return "Invalid category query."
+
+        # For each token, build a synonym set
+        token_term_sets = []
+        for token in tokens:
+            term_set = {token}
+
+            # Add translation if Turkish
+            translated = _translate_query(token)
+            if translated != token:
+                term_set.add(translated.lower())
+
+            # Add synonyms from _CATEGORY_SYNONYMS
+            for key, synonyms in _CATEGORY_SYNONYMS.items():
+                # Check if this token matches the key or any synonym
+                if any(t == key or t in synonyms for t in list(term_set)):
+                    term_set.update(synonyms)
+
+            token_term_sets.append(term_set)
+
+        # Filter results: a place matches if ALL tokens match (AND logic)
         filtered_results = []
         for r in results:
-            # Check both business_category and main_category
-            r_cat = r.get("business_category") or ""
-            r_main_cat = r.get("main_category") or ""
-            
-            combined_cats = f"{r_cat.lower()} {r_main_cat.lower()}".strip()
-            if not combined_cats:
+            r_cat = (r.get("business_category") or "").lower()
+            r_main_cat = (r.get("main_category") or "").lower()
+            r_name = (r.get("name") or "").lower()
+            combined_cats = f"{r_cat} {r_main_cat}".strip()
+
+            if not combined_cats and not r_name:
                 continue
-            
-            matched = False
-            for term in search_terms:
-                if term == "shop" or term == "store":
-                    # Only match if it's a whole word or significant part
-                    if term == combined_cats or f" {term}" in combined_cats or f"{term} " in combined_cats:
-                        matched = True
+
+            # Check if all token sets match
+            all_tokens_match = True
+            for term_set in token_term_sets:
+                token_matched = False
+                for term in term_set:
+                    if not term:
+                        continue
+
+                    # Check category fields (forward only — no reversed check)
+                    if term in combined_cats:
+                        token_matched = True
                         break
-                elif term in combined_cats or combined_cats in term:
-                    matched = True
+
+                    # Check place name for specific terms (min 4 chars to avoid noise)
+                    if len(term) >= 4 and term in r_name:
+                        token_matched = True
+                        break
+
+                if not token_matched:
+                    all_tokens_match = False
                     break
-            
-            if matched:
+
+            if all_tokens_match:
                 filtered_results.append(r)
 
         if not filtered_results:
             return f"No places found for category '{category_query}' in the provided list."
+
+        # Return JSON first (for proper extraction by agent), then human-readable text
+        json_output = json.dumps(filtered_results)
 
         output_lines = [f"Found {len(filtered_results)} places matching '{category_query}':\n"]
         for i, place in enumerate(filtered_results[:50], 1): # Limit to 50 for response length
@@ -415,7 +448,8 @@ def filter_places_by_category(places_json: str, category_query: str) -> str:
         if len(filtered_results) > 50:
             output_lines.append(f"\n... and {len(filtered_results) - 50} more places.")
 
-        return "\n".join(output_lines)
+        # Return JSON first so agent extracts the filtered results, then text for user readability
+        return f"{json_output}\n\n{'\n'.join(output_lines)}"
 
     except Exception as e:
         return f"Error filtering places: {str(e)}"

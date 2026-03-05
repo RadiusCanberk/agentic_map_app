@@ -46,6 +46,106 @@ def create_map_agent(model_name: str):
     return agent
 
 
+def _extract_places_from_tool_json(messages: list) -> list[dict]:
+    """
+    Extracts places from ToolMessage JSON outputs (search_places_in_polygon, filter_places_by_category).
+    Prioritizes filtered results (from filter_places_by_category) over raw results (from search_places_in_polygon).
+    """
+    places = []
+    seen = set()
+
+    # Collect all JSON arrays from tool messages
+    json_arrays = []
+    for msg in messages:
+        # Only process ToolMessage (tool outputs)
+        if type(msg).__name__ != "ToolMessage":
+            continue
+
+        content = ""
+        if hasattr(msg, "content"):
+            content = msg.content or ""
+        elif isinstance(msg, dict):
+            content = msg.get("content", "") or ""
+
+        if not content:
+            continue
+
+        # Skip non-JSON responses (polygon, country, error messages)
+        if not content.strip().startswith("["):
+            continue
+
+        try:
+            # Extract JSON from content start until we find a non-JSON character
+            # This handles cases where JSON is followed by text
+            json_str = content.strip()
+            # Find where valid JSON ends (look for closing bracket followed by non-whitespace)
+            for i in range(len(json_str), 0, -1):
+                try:
+                    data = json.loads(json_str[:i])
+                    if isinstance(data, list) and len(data) > 0:
+                        json_arrays.append(data)
+                    break
+                except json.JSONDecodeError:
+                    continue
+        except (json.JSONDecodeError, ValueError):
+            # Not valid JSON array, skip silently
+            pass
+
+    # If we have multiple JSON arrays, use the last one (from filter_places_by_category)
+    # Otherwise, use the first one (from search_places_in_polygon)
+    if json_arrays:
+        data = json_arrays[-1] if len(json_arrays) > 1 else json_arrays[0]
+        for item in data:
+            if isinstance(item, dict):
+                place = _extract_place_from_item(item)
+                if place:
+                    key = (round(place["lat"], 4), round(place["lon"], 4))
+                    if key not in seen:
+                        seen.add(key)
+                        places.append(place)
+
+    return places
+
+
+def _extract_place_from_item(item: dict) -> dict | None:
+    """Extracts a single place from a JSON object."""
+    if not isinstance(item, dict):
+        return None
+
+    # Try different field name combinations for coordinates
+    lat = None
+    lon = None
+
+    # Try standard field names
+    for lat_name in ["latitude", "lat", "y"]:
+        if lat_name in item:
+            try:
+                lat = float(item[lat_name])
+                break
+            except (ValueError, TypeError):
+                pass
+
+    for lon_name in ["longitude", "lon", "x"]:
+        if lon_name in item:
+            try:
+                lon = float(item[lon_name])
+                break
+            except (ValueError, TypeError):
+                pass
+
+    # If coordinates found, create place object
+    if lat is not None and lon is not None:
+        return {
+            "name": str(item.get("name", item.get("title", "Unknown"))),
+            "lat": lat,
+            "lon": lon,
+            "address": str(item.get("address", item.get("name", ""))),
+            "source": "api",
+        }
+
+    return None
+
+
 def _extract_places_from_messages(messages: list) -> list[dict]:
     """Extracts structured place data from all agent messages (tool outputs + final response)."""
     places = []
@@ -156,20 +256,18 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
             elif isinstance(last_message, dict):
                 response_text = last_message.get("content", "") or ""
 
-        # Extract structured places from tool outputs (ToolMessage) first, then fallback to AI messages
+        # Extract structured places from tool JSON outputs first (most reliable)
         tool_messages = [m for m in messages if type(m).__name__ == "ToolMessage" and getattr(m, "content", "")]
-        structured_places = _extract_places_from_messages(tool_messages)
+        final_ai_messages = [m for m in messages if type(m).__name__ == "AIMessage" and getattr(m, "content", "")]
+
+        structured_places = _extract_places_from_tool_json(tool_messages)
         polygon = _extract_polygon_from_messages(tool_messages)
 
-        # Also extract from AI messages and merge
-        final_ai_messages = [m for m in messages if type(m).__name__ == "AIMessage" and getattr(m, "content", "")]
-        ai_places = _extract_places_from_messages(final_ai_messages)
-        
-        # Deduplicate and merge
-        seen_names = {p["name"].lower() for p in structured_places}
-        for p in ai_places:
-            if p["name"].lower() not in seen_names:
-                structured_places.append(p)
+        # Fallback: extract from AI messages (text-based formatted places)
+        # Only if we didn't get places from tool JSON
+        if not structured_places:
+            ai_places = _extract_places_from_messages(final_ai_messages)
+            structured_places.extend(ai_places)
 
         if not polygon:
             polygon = _extract_polygon_from_messages(final_ai_messages)
