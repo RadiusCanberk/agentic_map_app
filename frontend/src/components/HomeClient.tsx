@@ -96,6 +96,7 @@ export default function HomeClient() {
   const [modelQuery, setModelQuery] = useState("");
   const [mapCenter, setMapCenter] = useState<MapCenter | null>(null);
   const [mapPlaces, setMapPlaces] = useState<Place[]>([]);
+  const [mapPolygon, setMapPolygon] = useState<any | null>(null);
   const [status, setStatus] = useState<"idle" | "thinking" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -159,7 +160,7 @@ export default function HomeClient() {
     }
   }, [modelName]);
 
-  const handleSubmit = async () => {
+    const handleSubmit = async () => {
     const prompt = input.trim();
     if (!prompt) return;
     setHasInteracted(true);
@@ -170,28 +171,33 @@ export default function HomeClient() {
 
     try {
       const baseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-      const res = await fetch(`${baseUrl}/agent/map`, {
+      const response = await fetch(`${baseUrl}/agent/map`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt, model_name: modelName }),
       });
 
-      if (!res.ok) {
-        const payload = await res.json().catch(() => ({}));
-        throw new Error(payload?.detail || `Request failed (${res.status})`);
+      if (!response.ok) {
+        throw new Error(`Request failed (${response.status})`);
       }
 
-      const data: { response?: string; center?: MapCenter; places?: Place[] } = await res.json();
+      const payload = await response.json();
+      
       setMessages((prev) => [
         ...prev,
-        { role: "agent", text: data.response || "No response." },
+        { role: "agent", text: payload.response || "No response." },
       ]);
-      if (data.center && typeof data.center.lat === "number") {
-        setMapCenter(data.center);
+
+      if (payload.center && typeof payload.center.lat === "number") {
+        setMapCenter(payload.center);
       }
-      if (Array.isArray(data.places)) {
-        setMapPlaces(data.places);
+      if (Array.isArray(payload.places) && payload.places.length > 0) {
+        setMapPlaces(payload.places);
       }
+      if (payload.polygon) {
+        setMapPolygon(payload.polygon);
+      }
+      
       setStatus("idle");
     } catch (err) {
       setStatus("error");
@@ -329,7 +335,7 @@ export default function HomeClient() {
             <div className="title">{t.mapTitle}</div>
             <div className="meta">{t.mapMeta}</div>
           </div>
-          <MapClient center={mapCenter} places={mapPlaces} />
+          <MapClient center={mapCenter} places={mapPlaces} polygon={mapPolygon} />
         </section>
       </section>
     </main>

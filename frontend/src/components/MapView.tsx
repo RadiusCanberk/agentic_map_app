@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
+import { MapContainer, TileLayer, Marker, Popup, useMap, GeoJSON } from "react-leaflet";
 import L from "leaflet";
 
 type MapCenter = {
@@ -27,25 +27,41 @@ const markerIcon = new L.Icon({
   shadowSize: [41, 41],
 });
 
-function MapUpdater({ center }: { center?: MapCenter | null }) {
+function MapUpdater({ center, polygon }: { center?: MapCenter | null, polygon?: any }) {
   const map = useMap();
   useEffect(() => {
     if (center?.lat && center?.lon) {
       map.setView([center.lat, center.lon], 13, { animate: true });
     }
   }, [center, map]);
+
+  useEffect(() => {
+    if (polygon) {
+      try {
+        const layer = L.geoJSON(polygon);
+        const bounds = layer.getBounds();
+        if (bounds.isValid()) {
+          map.fitBounds(bounds, { padding: [20, 20], animate: true });
+        }
+      } catch (e) {
+        console.error("Error fitting bounds to polygon:", e);
+      }
+    }
+  }, [polygon, map]);
+
   return null;
 }
 
 export default function MapView({
   center,
   places,
+  polygon,
 }: {
   center?: MapCenter | null;
   places?: Place[];
+  polygon?: any;
 }) {
   const [mounted, setMounted] = useState(false);
-  const [mapKey, setMapKey] = useState(() => `map-${Date.now()}`);
   const markers = useMemo(
     () => (places || []).filter((p) => typeof p.lat === "number" && typeof p.lon === "number"),
     [places]
@@ -53,7 +69,6 @@ export default function MapView({
 
   useEffect(() => {
     setMounted(true);
-    setMapKey(`map-${Date.now()}`);
   }, []);
 
   if (!mounted) {
@@ -67,17 +82,17 @@ export default function MapView({
   return (
     <div className="map-shell">
       <MapContainer
-        key={mapKey}
         center={[center?.lat || 41.0082, center?.lon || 28.9784]}
         zoom={12}
         scrollWheelZoom
         className="map"
       >
-        <MapUpdater center={center} />
+        <MapUpdater center={center} polygon={polygon} />
         <TileLayer
           attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
+        {polygon && <GeoJSON key={JSON.stringify(polygon)} data={polygon} style={{ color: "#3b82f6", weight: 2, fillOpacity: 0.1 }} />}
         {markers.length > 0 ? (
           markers.map((place, idx) => (
             <Marker

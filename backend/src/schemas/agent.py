@@ -44,3 +44,7 @@ class MapAgentResponse(BaseModel):
         description="Structured places with coordinates",
         examples=[[{"name": "Cafe", "lat": 41.01, "lon": 28.98, "address": "Kadikoy"}]],
     )
+    polygon: dict | None = Field(
+        default=None,
+        description="GeoJSON polygon for the requested area",
+    )

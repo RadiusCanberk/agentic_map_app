@@ -8,18 +8,17 @@ from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
 from src.core.settings import OPENROUTER_API_KEY, SYSTEM_PROMPT, OPENROUTER_BASE_URL
 from src.tools.map_tools import (
-    search_places_by_text,
-    search_nearby_places,
-    geocode_location,
-    get_place_details,
-    _nominatim_search_structured,
+    get_area_polygon,
+    get_country_for_area,
+    search_places_in_polygon,
+    filter_places_by_category,
 )
 
 TOOLS = [
-    search_places_by_text,
-    search_nearby_places,
-    geocode_location,
-    get_place_details,
+    get_area_polygon,
+    get_country_for_area,
+    search_places_in_polygon,
+    filter_places_by_category,
 ]
 
 
@@ -62,16 +61,15 @@ def _extract_places_from_messages(messages: list) -> list[dict]:
         if not content:
             continue
 
-        # Pattern 1: numbered list with name (possibly bold markdown), then coordinates line
-        # "1. **Place Name**\n   - Coordinates: 41.01, 28.97"
-        # "1. Place Name\n   📍 Coordinates: 41.01, 28.97"
+        # Pattern 1: Numbered list with coordinates
+        # Match: "1. Name", then maybe some lines, then "Coordinates: lat, lon"
         coord_blocks = re.findall(
-            r"\d+\.\s+\*{0,2}(.+?)\*{0,2}\s*\n(?:.*\n)*?.*?(?:📍|🧭|Coordinates?|Koordinat)[^\d]*([\d]+\.[\d]+),\s*([\d]+\.[\d]+)",
+            r"^\s*(\d+\.\s+)(.+?)\s*\n(?:.*\n)*?.*?(?:📍|🧭|Coordinates?|Koordinat)[^\d\-]*?(-?\d+\.\d+),\s*(-?\d+\.\d+)",
             content,
             re.MULTILINE,
         )
-        for name, lat, lon in coord_blocks:
-            name = name.strip()
+        for prefix, name, lat, lon in coord_blocks:
+            name = name.strip().replace("**", "")
             key = (round(float(lat), 4), round(float(lon), 4))
             if key not in seen:
                 seen.add(key)
@@ -83,13 +81,14 @@ def _extract_places_from_messages(messages: list) -> list[dict]:
                     "source": "agent",
                 })
 
-        # Pattern 2: "Latitude: 41.01\n   Longitude: 28.97" (geocode_location output)
-        geo_blocks = re.findall(
-            r"📍\s+(.+?)\n[^\n]*?Latitude[^\n]*?([\d]+\.[\d]+)\n[^\n]*?Longitude[^\n]*?([\d]+\.[\d]+)",
+        # Pattern 2: List without numbers (e.g. bold name)
+        # Match: "**Name**", then maybe some lines, then "Coordinates: lat, lon"
+        bold_blocks = re.findall(
+            r"^\s*\*{2}(.+?)\*{2}\s*\n(?:.*\n)*?.*?(?:📍|🧭|Coordinates?|Koordinat)[^\d\-]*?(-?\d+\.\d+),\s*(-?\d+\.\d+)",
             content,
             re.MULTILINE,
         )
-        for name, lat, lon in geo_blocks:
+        for name, lat, lon in bold_blocks:
             name = name.strip()
             key = (round(float(lat), 4), round(float(lon), 4))
             if key not in seen:
@@ -105,6 +104,26 @@ def _extract_places_from_messages(messages: list) -> list[dict]:
     return places
 
 
+def _extract_polygon_from_messages(messages: list) -> dict | None:
+    """Extracts GeoJSON polygon data from agent messages."""
+    for msg in messages:
+        content = ""
+        if hasattr(msg, "content"):
+            content = msg.content or ""
+        elif isinstance(msg, dict):
+            content = msg.get("content", "") or ""
+        
+        if "Polygon found for" in content:
+            try:
+                # Find the JSON part
+                match = re.search(r"Polygon found for .*?: (\{.*\})", content)
+                if match:
+                    return json.loads(match.group(1))
+            except Exception:
+                continue
+    return None
+
+
 async def run_map_agent(prompt: str, model_name: str) -> dict:
     """
     Runs the map agent with the given prompt.
@@ -118,6 +137,8 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
     structured_places = []
     center = None
     response_text = ""
+
+    polygon = None
 
     try:
         agent = create_map_agent(model_name)
@@ -138,32 +159,23 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
         # Extract structured places from tool outputs (ToolMessage) first, then fallback to AI messages
         tool_messages = [m for m in messages if type(m).__name__ == "ToolMessage" and getattr(m, "content", "")]
         structured_places = _extract_places_from_messages(tool_messages)
-        if not structured_places:
-            final_ai_messages = [m for m in messages if type(m).__name__ == "AIMessage" and getattr(m, "content", "")]
-            structured_places = _extract_places_from_messages(final_ai_messages)
+        polygon = _extract_polygon_from_messages(tool_messages)
+
+        # Also extract from AI messages and merge
+        final_ai_messages = [m for m in messages if type(m).__name__ == "AIMessage" and getattr(m, "content", "")]
+        ai_places = _extract_places_from_messages(final_ai_messages)
+        
+        # Deduplicate and merge
+        seen_names = {p["name"].lower() for p in structured_places}
+        for p in ai_places:
+            if p["name"].lower() not in seen_names:
+                structured_places.append(p)
+
+        if not polygon:
+            polygon = _extract_polygon_from_messages(final_ai_messages)
 
     except Exception as e:
         response_text = f"Agent error: {str(e)}"
-
-    # Fallback: direct Nominatim search only if agent completely failed (exception) and returned no places
-    agent_failed = response_text.startswith("Agent error:")
-    if not structured_places and agent_failed:
-        try:
-            from src.tools.map_tools import _translate_query
-            translated = _translate_query(prompt)
-            nominatim_places = _nominatim_search_structured(translated)
-            if not nominatim_places and translated != prompt:
-                nominatim_places = _nominatim_search_structured(prompt)
-            if nominatim_places:
-                structured_places = nominatim_places
-                if not response_text or "sonuç bulamadım" in response_text.lower() or "no results" in response_text.lower() or "error" in response_text.lower():
-                    lines = [f"Places found for '{prompt}':\n"]
-                    for i, p in enumerate(nominatim_places, 1):
-                        lines.append(f"{i}. {p['name']}\n   📍 Coordinates: {p['lat']}, {p['lon']}\n")
-                    response_text = "\n".join(lines)
-        except Exception as e:
-            if not response_text:
-                response_text = f"Search failed: {str(e)}"
 
     if not response_text:
         response_text = f"No results found for '{prompt}'."
@@ -182,4 +194,5 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
         "response": response_text,
         "center": center,
         "places": structured_places or None,
+        "polygon": polygon,
     }

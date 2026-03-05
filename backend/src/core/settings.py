@@ -20,3 +20,6 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL")
 # OpenStreetMap (Nominatim) usage identification
 NOMINATIM_USER_AGENT = os.getenv("NOMINATIM_USER_AGENT")
 NOMINATIM_EMAIL = os.getenv("NOMINATIM_EMAIL")
+
+# Placemaking API
+PLACEMAKING_API_URL = os.getenv("PLACEMAKING_API_URL")

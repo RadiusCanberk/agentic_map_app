@@ -4,13 +4,14 @@ LangChain tools for map searches using OpenStreetMap (Nominatim + Overpass)
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
 import httpx
 from langchain.tools import tool
 
-from src.core.settings import NOMINATIM_EMAIL, NOMINATIM_USER_AGENT
+from src.core.settings import NOMINATIM_EMAIL, NOMINATIM_USER_AGENT, PLACEMAKING_API_URL
 
 NOMINATIM_BASE = "https://nominatim.openstreetmap.org"
 # Multiple Overpass mirrors — tried in order until one succeeds
@@ -20,6 +21,10 @@ OVERPASS_MIRRORS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 USER_AGENT = NOMINATIM_USER_AGENT or "AgenticMapApp/1.0 (contact: dev@example.com)"
+
+# Placemaking API countries endpoint
+PLACEMAKING_COUNTRIES_URL = "https://placemaking.test.brick-n-data.com/every-data/locations/get-country"
+_PLACEMAKING_COUNTRIES_CACHE: list[dict] | None = None
 
 
 def _nominatim_get(path: str, params: dict) -> dict | list:
@@ -47,6 +52,32 @@ def _overpass_query(query: str) -> dict:
             last_exc = exc
             continue
     raise last_exc or RuntimeError("All Overpass mirrors failed")
+
+
+def _fetch_placemaking_countries() -> list[dict]:
+    """Fetches and caches the list of countries from Placemaking API."""
+    global _PLACEMAKING_COUNTRIES_CACHE
+    if _PLACEMAKING_COUNTRIES_CACHE is not None:
+        return _PLACEMAKING_COUNTRIES_CACHE
+
+    headers = {"User-Agent": USER_AGENT}
+    with httpx.Client(timeout=10.0, headers=headers) as client:
+        resp = client.get(PLACEMAKING_COUNTRIES_URL)
+        resp.raise_for_status()
+        data = resp.json()
+        # API returns: {"result": {"is_success": true, "result": [{...}, ...]}}
+        countries = []
+        if isinstance(data, list):
+            countries = data
+        elif isinstance(data, dict):
+            # Try nested structure first: data["result"]["result"]
+            result = data.get("result")
+            if isinstance(result, dict):
+                countries = result.get("result", [])
+            elif isinstance(result, list):
+                countries = result
+        _PLACEMAKING_COUNTRIES_CACHE = countries
+    return _PLACEMAKING_COUNTRIES_CACHE
 
 
 def _format_address(tags: dict) -> str:
@@ -98,6 +129,24 @@ _TR_TO_EN = {
     "market": "supermarket", "süpermarket": "supermarket",
     "park": "park", "müze": "museum",
     "okul": "school", "üniversite": "university",
+    "avm": "mall", "alışveriş": "mall", "merkezi": "mall",
+    "spor": "gym", "fitness": "gym", "salon": "gym",
+    "kütüphane": "library", "kitap": "library",
+    "sinema": "cinema", "tiyatro": "theatre",
+}
+
+# Synonyms for business categories to improve filtering
+_CATEGORY_SYNONYMS = {
+    "restaurant": ["restaurant", "food", "dining", "eatery", "brasserie", "diner", "restoran", "yemek"],
+    "cafe": ["cafe", "coffee", "tea", "bakery", "pastry", "kafe", "kahve", "pastane"],
+    "bar": ["bar", "pub", "club", "nightlife", "lounge", "meyhane", "birahane"],
+    "supermarket": ["supermarket", "grocery", "market", "shop", "store", "bakkal", "manav"],
+    "pharmacy": ["pharmacy", "drugstore", "chemist", "apothecary", "eczane"],
+    "hospital": ["hospital", "clinic", "medical", "doctor", "health", "hastane", "klinik", "sağlık"],
+    "hotel": ["hotel", "motel", "hostel", "accommodation", "lodging", "inn", "otel", "pansiyon", "konaklama"],
+    "gym": ["gym", "fitness", "sports", "workout", "club", "spor", "salon", "antrenman"],
+    "school": ["school", "university", "college", "education", "academy", "okul", "üniversite", "eğitim"],
+    "park": ["park", "garden", "recreation", "nature", "outdoor", "bahçe", "doğa"],
 }
 
 
@@ -146,6 +195,273 @@ def _extract_amenity(query: str) -> Optional[str]:
         if keyword in q_lower:
             return amenity
     return None
+
+
+@tool
+def get_country_for_area(area_name: str) -> str:
+    """
+    Determines the correct Placemaking-compatible country name for a given area.
+    Call this BEFORE search_places_in_polygon to get the correct country value.
+
+    Args:
+        area_name: Area/city name (e.g., 'Kadıköy', 'İstanbul', 'Paris')
+    Returns:
+        Country name as expected by Placemaking API (e.g., 'Turkey', 'France', 'UK')
+    """
+    try:
+        # Step 1: Nominatim reverse lookup → get country_code + country name
+        results = _nominatim_get("/search", {
+            "q": area_name, "format": "json", "limit": 1, "addressdetails": 1
+        })
+        if not results:
+            return f"Could not determine country for: {area_name}"
+
+        address = results[0].get("address", {})
+        country_code = address.get("country_code", "").upper()    # e.g., "TR"
+        nominatim_country = address.get("country", "")            # e.g., "Türkiye"
+
+        # Step 2: Fetch Placemaking countries list (cached after first call)
+        try:
+            countries = _fetch_placemaking_countries()
+        except Exception as e:
+            return nominatim_country or f"Country lookup failed: {str(e)}"
+
+        # Step 3: Match by country_code first, then by name
+        for c in countries:
+            c_code = (c.get("country_code") or c.get("code") or "").upper()
+            c_name = c.get("name") or c.get("country") or ""
+            if c_code and c_code == country_code:
+                return c_name
+            if nominatim_country and nominatim_country.lower() in c_name.lower():
+                return c_name
+
+        return nominatim_country or "Unknown"
+
+    except Exception as e:
+        return f"Error determining country: {str(e)}"
+
+
+@tool
+def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> str:
+    """
+    Searches for businesses and POIs (restaurants, cafes, shops, etc.) within a given area polygon.
+    Use this tool AFTER getting a polygon with get_area_polygon to find all places in that area.
+
+    Args:
+        polygon_geojson: GeoJSON polygon string or the output from get_area_polygon tool.
+        country: Country name for the Placemaking API (get this from get_country_for_area tool).
+
+    Returns:
+        JSON string containing list of places with name, latitude, longitude, address, and business category.
+
+    Example workflow:
+        1. First call get_area_polygon("Kadıköy") to get the polygon
+        2. Then call get_country_for_area("Kadıköy") to get the correct country
+        3. Then call this function with the polygon and country to find all places
+        4. Optionally call filter_places_by_category to filter by type
+    """
+    if not PLACEMAKING_API_URL:
+        return "Placemaking API URL is not configured."
+
+    try:
+        # Extract JSON from the response string if it contains "Polygon found for" prefix
+        json_str = polygon_geojson
+        if "Polygon found for" in polygon_geojson:
+            # Extract the JSON part after the colon
+            match = re.search(r"Polygon found for .*?:\s*(\{.*\})\s*$", polygon_geojson, re.DOTALL)
+            if match:
+                json_str = match.group(1)
+
+        # Parse the JSON string
+        poly_data = json.loads(json_str)
+
+        # Convert to FeatureCollection if needed
+        if poly_data.get("type") != "FeatureCollection":
+            poly_data = {
+                "type": "FeatureCollection",
+                "features": [
+                    {
+                        "type": "Feature",
+                        "properties": {},
+                        "geometry": poly_data
+                    }
+                ]
+            }
+
+        payload = {
+            "country": country,
+            "polygon": poly_data
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+        with httpx.Client(timeout=30000.0, headers=headers) as client:
+            resp = client.post(PLACEMAKING_API_URL, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        results = data.get("result", {}).get("result", [])
+        if not results:
+            return "No places found within this polygon in the live data."
+
+        # Return the results as a JSON string so they can be processed by other tools
+        return json.dumps(results)
+
+    except json.JSONDecodeError as e:
+        return f"Error parsing polygon JSON: {str(e)}. Received data: {polygon_geojson[:200]}..."
+    except httpx.HTTPStatusError as e:
+        return f"API request failed with status {e.response.status_code}: {e.response.text[:200]}"
+    except httpx.RequestError as e:
+        return f"Request error: {str(e)}"
+    except Exception as e:
+        return f"Error searching in polygon: {str(e)}"
+
+
+@tool
+def filter_places_by_category(places_json: str, category_query: str) -> str:
+    """
+    Filters a list of places by business_category or main_category based on a category query.
+    Args:
+        places_json: JSON string containing the list of places to filter.
+        category_query: The category to search for (e.g., 'restaurant', 'cafe', 'market').
+    """
+    try:
+        results = json.loads(places_json)
+        if not isinstance(results, list):
+            return "Invalid places data provided."
+
+        cat_lower = category_query.lower()
+        
+        # Identify search terms (original + translated + synonyms)
+        search_terms = {cat_lower}
+        
+        # Add translation if it's Turkish
+        translated = _translate_query(cat_lower)
+        if translated != cat_lower:
+            search_terms.add(translated.lower())
+            
+        # Add synonyms if any search term matches a key in _CATEGORY_SYNONYMS
+        extra_terms = set()
+        for term in search_terms:
+            for key, synonyms in _CATEGORY_SYNONYMS.items():
+                if term == key or term in synonyms:
+                    extra_terms.update(synonyms)
+        search_terms.update(extra_terms)
+
+        filtered_results = []
+        for r in results:
+            # Check both business_category and main_category
+            r_cat = r.get("business_category") or ""
+            r_main_cat = r.get("main_category") or ""
+            
+            combined_cats = f"{r_cat.lower()} {r_main_cat.lower()}".strip()
+            if not combined_cats:
+                continue
+            
+            matched = False
+            for term in search_terms:
+                if term == "shop" or term == "store":
+                    # Only match if it's a whole word or significant part
+                    if term == combined_cats or f" {term}" in combined_cats or f"{term} " in combined_cats:
+                        matched = True
+                        break
+                elif term in combined_cats or combined_cats in term:
+                    matched = True
+                    break
+            
+            if matched:
+                filtered_results.append(r)
+
+        if not filtered_results:
+            return f"No places found for category '{category_query}' in the provided list."
+
+        output_lines = [f"Found {len(filtered_results)} places matching '{category_query}':\n"]
+        for i, place in enumerate(filtered_results[:30], 1): # Limit to 30 for response length
+            name = place.get("name", "Unknown")
+            lat = place.get("latitude")
+            lon = place.get("longitude")
+            address = place.get("street_address", "No address")
+            category = place.get("business_category", "N/A")
+            main_category = place.get("main_category", "N/A")
+            
+            output_lines.append(
+                f"{i}. {name}\n"
+                f"   📍 Coordinates: {lat}, {lon}\n"
+                f"   🏠 Address: {address}\n"
+                f"   🧭 Business Category: {category}\n"
+                f"   🏷️ Main Category: {main_category}\n"
+            )
+        
+        if len(filtered_results) > 30:
+            output_lines.append(f"\n... and {len(filtered_results) - 30} more places.")
+
+        return "\n".join(output_lines)
+
+    except Exception as e:
+        return f"Error filtering places: {str(e)}"
+
+
+@tool
+def get_area_polygon(area_name: str) -> str:
+    """
+    Fetches the GeoJSON polygon for a given area name (city, district, etc.).
+    Example: 'Kadıköy', 'Beşiktaş', 'İstanbul'
+    Args:
+        area_name: Name of the area to get the polygon for.
+    """
+    try:
+        # Step 1: Search for the area
+        results = _nominatim_get(
+            "/search",
+            {
+                "q": area_name,
+                "format": "json",
+                "polygon_geojson": 1,
+                "limit": 10,
+                "addressdetails": 1,
+            },
+        )
+        if not results:
+            return f"No polygon found for area: {area_name}"
+
+        # Step 2: Try to find the best match (prioritize administrative boundaries)
+        best_match = None
+        
+        # Priority 1: Exact match on type (city, district, administrative)
+        for res in results:
+            geojson = res.get("geojson")
+            if not geojson or geojson.get("type") not in ["Polygon", "MultiPolygon"]:
+                continue
+            
+            place_type = res.get("type", "")
+            place_class = res.get("class", "")
+            
+            # These are usually what users mean by 'area'
+            if place_class == "boundary" and place_type == "administrative":
+                best_match = res
+                break
+        
+        # Priority 2: Any Polygon/MultiPolygon
+        if not best_match:
+            for res in results:
+                geojson = res.get("geojson")
+                if geojson and geojson.get("type") in ["Polygon", "MultiPolygon"]:
+                    best_match = res
+                    break
+        
+        if not best_match:
+            return f"No boundary polygon found for area: {area_name}. Found results but they don't have polygon data."
+
+        name = best_match.get("display_name", area_name)
+        geojson = best_match.get("geojson")
+        
+        return f"Polygon found for {name}: {json.dumps(geojson)}"
+
+    except Exception as e:
+        return f"Error fetching polygon: {str(e)}"
 
 
 @tool

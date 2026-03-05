@@ -20,9 +20,11 @@ type Place = {
 export default function MapClient({
   center,
   places,
+  polygon,
 }: {
   center?: MapCenter | null;
   places?: Place[];
+  polygon?: any;
 }) {
-  return <MapView center={center} places={places} />;
+  return <MapView center={center} places={places} polygon={polygon} />;
 }
