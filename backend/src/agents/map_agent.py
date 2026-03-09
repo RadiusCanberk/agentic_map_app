@@ -11,12 +11,14 @@ from src.tools.map_tools import (
     get_area_polygon,
     get_country_for_area,
     search_places_in_polygon,
+    filter_places_by_categories,
 )
 
 TOOLS = [
-    get_area_polygon,
     get_country_for_area,
+    get_area_polygon,
     search_places_in_polygon,
+    filter_places_by_categories,
 ]
 
 
@@ -45,9 +47,17 @@ def create_map_agent(model_name: str):
 
 
 def _extract_places_from_tool_json(messages: list) -> list[dict]:
-    """Extracts places from search_places_in_polygon JSON output."""
+    """
+    Extracts places from tool JSON outputs.
+    Strategy: Use the LAST tool output (which should be filtered results from filter_places_by_categories).
+    If that's not available, fall back to raw results from search_places_in_polygon.
+    This ensures we only show filtered places when filtering is applied.
+    """
     places = []
     seen = set()
+
+    # Find all ToolMessage outputs with JSON content
+    json_tool_messages = []
 
     for msg in messages:
         # Only process ToolMessage (tool outputs)
@@ -64,26 +74,80 @@ def _extract_places_from_tool_json(messages: list) -> list[dict]:
             continue
 
         # Skip non-JSON responses (polygon, country, error messages)
+        # Accept FILTERED_DATA::: prefix or raw JSON arrays
+        if "FILTERED_DATA:::" in content:
+            # Extract JSON part after prefix
+            json_part = content.split("FILTERED_DATA:::", 1)[1].strip()
+            json_tool_messages.append(json_part)
+            continue
+
+        # Skip SEARCH_DONE::: messages (no JSON, just a status message)
+        if "SEARCH_DONE:::" in content:
+            continue
+
         if not content.strip().startswith("["):
             continue
 
-        try:
-            # Parse JSON array
-            data = json.loads(content)
+        json_tool_messages.append(content)
 
-            # Handle list of places
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        place = _extract_place_from_item(item)
-                        if place:
-                            key = (round(place["lat"], 4), round(place["lon"], 4))
-                            if key not in seen:
-                                seen.add(key)
-                                places.append(place)
-        except (json.JSONDecodeError, ValueError):
-            # Not valid JSON array, skip silently
-            pass
+    # Use the LAST JSON tool message (filtered results should be last)
+    # This prevents mixing raw search results with filtered results
+    if not json_tool_messages:
+        return places
+
+    content = json_tool_messages[-1]
+
+    try:
+        # Extract JSON array from content (may have formatted text after it)
+        # filter_places_by_categories returns: [JSON]\n\nFormatted text
+        json_str = content
+
+        # Try to find JSON array boundaries
+        bracket_count = 0
+        json_end = 0
+        in_string = False
+        escape_next = False
+
+        for i, char in enumerate(content):
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+
+            if char == '[':
+                bracket_count += 1
+            elif char == ']':
+                bracket_count -= 1
+                if bracket_count == 0:
+                    json_end = i + 1
+                    break
+
+        if json_end > 0:
+            json_str = content[:json_end]
+
+        # Parse JSON array
+        data = json.loads(json_str)
+
+        # Handle list of places
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    place = _extract_place_from_item(item)
+                    if place:
+                        key = (round(place["lat"], 4), round(place["lon"], 4))
+                        if key not in seen:
+                            seen.add(key)
+                            places.append(place)
+    except (json.JSONDecodeError, ValueError):
+        # Not valid JSON array, skip silently
+        pass
 
     return places
 
@@ -194,12 +258,10 @@ def _extract_polygon_from_messages(messages: list) -> dict | None:
         elif isinstance(msg, dict):
             content = msg.get("content", "") or ""
         
-        if "Polygon found for" in content:
+        if "POLYGON_DATA:::" in content:
             try:
-                # Find the JSON part
-                match = re.search(r"Polygon found for .*?: (\{.*\})", content)
-                if match:
-                    return json.loads(match.group(1))
+                json_str = content.split("POLYGON_DATA:::", 1)[1].strip()
+                return json.loads(json_str)
             except Exception:
                 continue
     return None
@@ -253,6 +315,10 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
         if not polygon:
             polygon = _extract_polygon_from_messages(final_ai_messages)
 
+        # Limit places to 300
+        if structured_places:
+            structured_places = structured_places[:300]
+
     except Exception as e:
         response_text = f"Agent error: {str(e)}"
 
@@ -272,6 +338,6 @@ async def run_map_agent(prompt: str, model_name: str) -> dict:
         "query": prompt,
         "response": response_text,
         "center": center,
-        "places": structured_places or None,
+        "places": structured_places,  # Always return list (empty if no results)
         "polygon": polygon,
     }

@@ -188,14 +188,20 @@ export default function HomeClient() {
         { role: "agent", text: payload.response || "No response." },
       ]);
 
+      // Always update map state, even if empty (to clear old results)
       if (payload.center && typeof payload.center.lat === "number") {
         setMapCenter(payload.center);
+      } else {
+        setMapCenter(null);
       }
-      if (Array.isArray(payload.places) && payload.places.length > 0) {
-        setMapPlaces(payload.places);
-      }
+
+      // Set places explicitly - use empty array if no results
+      setMapPlaces(Array.isArray(payload.places) ? payload.places : []);
+
       if (payload.polygon) {
         setMapPolygon(payload.polygon);
+      } else {
+        setMapPolygon(null);
       }
       
       setStatus("idle");

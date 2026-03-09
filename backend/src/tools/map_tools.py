@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
+from typing import Optional, Any
 
 import httpx
 from langchain.tools import tool
@@ -25,6 +25,9 @@ USER_AGENT = NOMINATIM_USER_AGENT or "AgenticMapApp/1.0 (contact: dev@example.co
 # Placemaking API countries endpoint
 PLACEMAKING_COUNTRIES_URL = "https://placemaking.test.brick-n-data.com/every-data/locations/get-country"
 _PLACEMAKING_COUNTRIES_CACHE: list[dict] | None = None
+
+# Cache for last search results — avoids passing large JSON through agent LLM
+_LAST_SEARCH_RESULTS: list[dict] = []
 
 
 def _nominatim_get(path: str, params: dict) -> dict | list:
@@ -206,6 +209,36 @@ def _extract_amenity(query: str) -> Optional[str]:
     return None
 
 
+# Fallback country code to English name mapping (for when Placemaking API fails)
+_COUNTRY_CODE_TO_NAME = {
+    "TR": "Turkey",
+    "US": "United States",
+    "GB": "UK",
+    "FR": "France",
+    "DE": "Germany",
+    "IT": "Italy",
+    "ES": "Spain",
+    "NL": "Netherlands",
+    "BE": "Belgium",
+    "AT": "Austria",
+    "CH": "Switzerland",
+    "SE": "Sweden",
+    "NO": "Norway",
+    "DK": "Denmark",
+    "FI": "Finland",
+    "PL": "Poland",
+    "CZ": "Czech Republic",
+    "GR": "Greece",
+    "PT": "Portugal",
+    "JP": "Japan",
+    "CN": "China",
+    "IN": "India",
+    "BR": "Brazil",
+    "CA": "Canada",
+    "AU": "Australia",
+}
+
+
 @tool
 def get_country_for_area(area_name: str) -> str:
     """
@@ -227,26 +260,26 @@ def get_country_for_area(area_name: str) -> str:
 
         address = results[0].get("address", {})
         country_code = address.get("country_code", "").upper()    # e.g., "TR"
-        nominatim_country = address.get("country", "")            # e.g., "Türkiye"
 
         # Step 2: Fetch Placemaking countries list (cached after first call)
         try:
             countries = _fetch_placemaking_countries()
         except Exception as e:
-            return nominatim_country or f"Country lookup failed: {str(e)}"
+            # Fallback to hardcoded mapping if Placemaking API fails
+            return _COUNTRY_CODE_TO_NAME.get(country_code, f"Country lookup failed: {str(e)}")
 
-        # Step 3: Match by country_code first, then by name
+        # Step 3: Match by country_code first
         for c in countries:
             c_code = (c.get("country_code") or c.get("code") or "").upper()
             c_name = c.get("name") or c.get("country") or ""
             if c_code and c_code == country_code:
                 return c_name
-            if nominatim_country and nominatim_country.lower() in c_name.lower():
-                return c_name
 
-        return nominatim_country or "Unknown"
+        # Step 4: If no match found, use hardcoded mapping
+        return _COUNTRY_CODE_TO_NAME.get(country_code, "Unknown")
 
     except Exception as e:
+        # Last resort fallback
         return f"Error determining country: {str(e)}"
 
 
@@ -273,13 +306,10 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
         return "Placemaking API URL is not configured."
 
     try:
-        # Extract JSON from the response string if it contains "Polygon found for" prefix
+        # Extract JSON from the response string if it contains POLYGON_DATA::: prefix
         json_str = polygon_geojson
-        if "Polygon found for" in polygon_geojson:
-            # Extract the JSON part after the colon
-            match = re.search(r"Polygon found for .*?:\s*(\{.*\})\s*$", polygon_geojson, re.DOTALL)
-            if match:
-                json_str = match.group(1)
+        if "POLYGON_DATA:::" in polygon_geojson:
+            json_str = polygon_geojson.split("POLYGON_DATA:::", 1)[1].strip()
 
         # Parse the JSON string
         poly_data = json.loads(json_str)
@@ -324,11 +354,13 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
             return "No places found within this polygon in the live data."
 
         # Limit results to reduce token count in agent (avoid exceeding LLM context window)
-        # Keep top 100 places sorted by relevance (order from API)
-        results = results[:100]
+        results = results[:300]
 
-        # Return the results as a JSON string so they can be processed by other tools
-        return json.dumps(results)
+        # Cache results so filter_places_by_categories can access without agent passing large JSON
+        global _LAST_SEARCH_RESULTS
+        _LAST_SEARCH_RESULTS = results
+
+        return f"SEARCH_DONE:::{len(results)} places found. Now call filter_places_by_categories with categories parameter to filter these results."
 
     except json.JSONDecodeError as e:
         return f"Error parsing polygon JSON: {str(e)}. Received data: {polygon_geojson[:200]}..."
@@ -347,112 +379,365 @@ def search_places_in_polygon(polygon_geojson: str, country: str = "Unknown") -> 
 
 
 @tool
-def filter_places_by_category(places_json: str, category_query: str) -> str:
+def filter_places_by_categories(places_json: Any, categories: str) -> str:
     """
-    Filters a list of places by business_category or main_category based on a category query.
-    Supports multi-word queries and specific cuisine types (e.g., 'burger restaurants', 'pizza places').
+    Filters POI places intelligently using LLM (semantic understanding, not pattern matching).
+    The LLM analyzes place names and categories to find intelligent matches.
+    Handles large result sets with batching and provides robust error handling.
 
     Args:
-        places_json: JSON string containing the list of places to filter.
-        category_query: The category to search for (e.g., 'restaurant', 'burger restaurants', 'pizza', 'cafe').
+        places_json: JSON string containing the list of places (from search_places_in_polygon)
+        categories: Category query (e.g., 'burger restaurants', 'pizza places', 'Limited-Service Restaurants')
+
+    Returns:
+        JSON string with filtered places + human-readable formatted output
+
+    Example:
+        places_json: '[{"name": "Burger King", "business_category": "Limited-Service Restaurants", ...}]'
+        categories: "burger restaurants"
     """
     try:
-        results = json.loads(places_json)
+        from langchain_openai import ChatOpenAI
+        from src.core.settings import OPENROUTER_API_KEY, OPENROUTER_BASE_URL
+
+        # Use cached results from search_places_in_polygon (avoids passing large JSON through agent)
+        global _LAST_SEARCH_RESULTS
+        if _LAST_SEARCH_RESULTS:
+            results = _LAST_SEARCH_RESULTS
+        elif isinstance(places_json, list):
+            results = places_json
+        elif isinstance(places_json, str) and places_json.strip().startswith("["):
+            results = json.loads(places_json)
+        else:
+            results = []
+
         if not isinstance(results, list):
             return "Invalid places data provided."
 
-        cat_lower = category_query.lower()
+        if not results:
+            return f"No places available to filter for: {categories}"
 
-        # Tokenize query into individual words
-        tokens = cat_lower.split()
-        if not tokens:
-            return "Invalid category query."
+        if not OPENROUTER_API_KEY:
+            return "LLM API key not configured. Cannot perform intelligent filtering."
 
-        # For each token, build a synonym set
-        token_term_sets = []
-        for token in tokens:
-            term_set = {token}
-
-            # Add translation if Turkish
-            translated = _translate_query(token)
-            if translated != token:
-                term_set.add(translated.lower())
-
-            # Add synonyms from _CATEGORY_SYNONYMS
-            for key, synonyms in _CATEGORY_SYNONYMS.items():
-                # Check if this token matches the key or any synonym
-                if any(t == key or t in synonyms for t in list(term_set)):
-                    term_set.update(synonyms)
-
-            token_term_sets.append(term_set)
-
-        # Filter results: a place matches if ALL tokens match (AND logic)
+        # Process in batches of 50 places for better LLM performance
+        BATCH_SIZE = 50
         filtered_results = []
-        for r in results:
-            r_cat = (r.get("business_category") or "").lower()
-            r_main_cat = (r.get("main_category") or "").lower()
-            r_name = (r.get("name") or "").lower()
-            combined_cats = f"{r_cat} {r_main_cat}".strip()
 
-            if not combined_cats and not r_name:
-                continue
+        for batch_start in range(0, len(results), BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, len(results))
+            batch = results[batch_start:batch_end]
 
-            # Check if all token sets match
-            all_tokens_match = True
-            for term_set in token_term_sets:
-                token_matched = False
-                for term in term_set:
-                    if not term:
-                        continue
+            # Prepare data summary for LLM
+            places_summary = []
+            for idx_in_batch, place in enumerate(batch):
+                places_summary.append({
+                    "index": idx_in_batch,
+                    "name": place.get("name", "Unknown"),
+                    "business_category": place.get("business_category", "N/A"),
+                    "main_category": place.get("main_category", "N/A"),
+                    "street_address": place.get("street_address", ""),
+                    "city": place.get("city", ""),
+                })
 
-                    # Check category fields (forward only — no reversed check)
-                    if term in combined_cats:
-                        token_matched = True
-                        break
+            # Create enhanced prompt with Turkish/English examples and reasoning request
+            llm_prompt = f"""You are a place filtering assistant. Analyze POI places and find semantic matches.
+            
+            User category query: "{categories}"
+            
+            Places to analyze:
+            {json.dumps(places_summary, indent=2)}
+            
+            MATCHING RULES (use broad semantic understanding — err on the side of inclusion):
+            - "restaurant/restoran/yemek/food": Match ANY place related to eating/dining: restaurants, lokanta, bistro, fast food, kebab, pizza, burger, döner, pide, lahmacun, köfte, balık evi, meze, ocakbaşı, mangal, izgara, çorba, börek, simit, pastane, fırın, hazır yemek, yemek fabrikası, catering, Full-Service Restaurants, Limited-Service Restaurants, Snack and Nonalcoholic Beverage Bars, Special Food Services, Food Service Contractors. Also match by NAME if it sounds like a restaurant (e.g., "Kebapçı", "Pide Salonu", "Lokanta", "Restoran").
+            - "cafe/coffee/kahve": Match "Cafe", "Coffee", "Kahve", "Tea House", "Pastry", "Bakery", "Fırın"
+            - "bar/pub/meyhane": Match "Bar", "Pub", "Meyhane", "Nightlife", "Birahane"
+            - "market/supermarket": Match "Grocery", "Supermarket", "Market", "Food & Beverage Stores"
+            - "pharmacy/eczane": Match "Pharmacy", "Eczane", "Drug Store"
+            - "burger/hamburger": Match burger/fast food places specifically
+            - "pizza/pizzeria": Match pizza places specifically
+            - "kebab/döner": Match kebab/döner places specifically
+            - For ANY food/dining query: be INCLUSIVE — if unsure whether a place serves food, include it
+            
+            IMPORTANT: If the query is about restaurants/food, include ALL food-related places. It is better to include too many than too few.
+            
+            Task:
+            1. Understand user's intent broadly — when in doubt, include the place
+            2. Match based on place NAME and CATEGORY fields
+            3. Return ONLY valid JSON with two fields:
+               - "filtered_indices": array of matching indices [0, 2, 5]
+               - "reasoning": brief explanation (1 sentence)
+            
+            Example response:
+            {{"filtered_indices": [0, 1, 3], "reasoning": "Matched places with restaurant categories"}}
+            
+            Return ONLY valid JSON, no extra text."""
 
-                    # Check place name for specific terms (min 4 chars to avoid noise)
-                    if len(term) >= 4 and term in r_name:
-                        token_matched = True
-                        break
+            # Call LLM for intelligent filtering
+            llm = ChatOpenAI(
+                model="openrouter/auto",
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL,
+                temperature=0,  # Deterministic classification
+            )
 
-                if not token_matched:
-                    all_tokens_match = False
-                    break
+            try:
+                response = llm.invoke(llm_prompt)
+                llm_response = response.content.strip()
 
-            if all_tokens_match:
-                filtered_results.append(r)
+                # Strip markdown code blocks if present (e.g. ```json ... ```)
+                if llm_response.startswith("```"):
+                    llm_response = re.sub(r"^```[a-zA-Z]*\n?", "", llm_response)
+                    llm_response = re.sub(r"\n?```$", "", llm_response).strip()
+
+                # Parse LLM response
+                parsed = json.loads(llm_response)
+                filtered_indices = parsed.get("filtered_indices", [])
+                reasoning = parsed.get("reasoning", "")
+
+            except json.JSONDecodeError:
+                # Fallback: Use pattern matching from old tool
+                filtered_indices = _fallback_pattern_filter(batch, categories)
+                reasoning = "Fallback pattern matching used"
+            except Exception as e:
+                return f"LLM filtering error: {str(e)}"
+
+            # Extract filtered places from this batch using indices
+            for idx in filtered_indices:
+                if 0 <= idx < len(batch):
+                    filtered_results.append(batch[idx])
 
         if not filtered_results:
-            return f"No places found for category '{category_query}' in the provided list."
+            # Fallback: if LLM found nothing, return all results (better than empty)
+            filtered_results = results
+            reasoning_fallback = f"No specific matches found for '{categories}', returning all {len(results)} places."
 
-        # Return JSON first (for proper extraction by agent), then human-readable text
+        # Format output: FILTERED_DATA::: prefix for reliable extraction, then human-readable
         json_output = json.dumps(filtered_results)
 
-        output_lines = [f"Found {len(filtered_results)} places matching '{category_query}':\n"]
-        for i, place in enumerate(filtered_results[:50], 1): # Limit to 50 for response length
+        output_lines = [f"Found {len(filtered_results)} places matching '{categories}':\n"]
+        for i, place in enumerate(filtered_results[:50], 1):  # Show max 50
             name = place.get("name", "Unknown")
             lat = place.get("latitude")
             lon = place.get("longitude")
             address = place.get("street_address", "No address")
-            category = place.get("business_category", "N/A")
-            main_category = place.get("main_category", "N/A")
+            business_cat = place.get("business_category", "N/A")
+            main_cat = place.get("main_category", "N/A")
+            city = place.get("city", "N/A")
 
             output_lines.append(
                 f"{i}. {name}\n"
-                f"   📍 Coordinates: {lat}, {lon}\n"
-                f"   🏠 Address: {address}\n"
-                f"   🧭 Business Category: {category}\n"
-                f"   🏷️ Main Category: {main_category}\n"
+                f"   📍 {lat}, {lon}\n"
+                f"   🏠 {address} - {city}\n"
+                f"   🧭 {business_cat} | {main_cat}\n"
             )
 
         if len(filtered_results) > 50:
             output_lines.append(f"\n... and {len(filtered_results) - 50} more places.")
 
-        # Return JSON first so agent extracts the filtered results, then text for user readability
-        return f"{json_output}\n\n{'\n'.join(output_lines)}"
+        return f"FILTERED_DATA:::{json_output}\n\n{''.join(output_lines)}"
 
+    except json.JSONDecodeError as e:
+        return f"Error parsing places JSON: {str(e)}"
     except Exception as e:
         return f"Error filtering places: {str(e)}"
+
+
+def _fallback_pattern_filter(places: list[dict], category_query: str) -> list[int]:
+    """Fallback pattern matching for when LLM filtering fails."""
+    cat_lower = category_query.lower()
+    tokens = cat_lower.split()
+
+    if not tokens:
+        return []
+
+    matched_indices = []
+
+    for idx, place in enumerate(places):
+        r_cat = (place.get("business_category") or "").lower()
+        r_main_cat = (place.get("main_category") or "").lower()
+        r_name = (place.get("name") or "").lower()
+        combined_cats = f"{r_cat} {r_main_cat}".strip()
+
+        # Check if any token matches
+        all_tokens_match = True
+        for token in tokens:
+            token_matched = False
+
+            # Check category fields
+            if token in combined_cats:
+                token_matched = True
+            # Check place name for meaningful terms (min 4 chars)
+            elif len(token) >= 4 and token in r_name:
+                token_matched = True
+
+            if not token_matched:
+                all_tokens_match = False
+                break
+
+        if all_tokens_match:
+            matched_indices.append(idx)
+
+    return matched_indices
+
+
+@tool
+def search_and_filter_places(polygon_geojson: str, country: str, categories: str) -> str:
+    """
+    Combined tool: Searches for POIs within a polygon AND filters them by category in one step.
+    Use this instead of calling search_places_in_polygon + filter_places_by_categories separately.
+    This avoids passing large JSON between tools through the agent.
+
+    Args:
+        polygon_geojson: The output from get_area_polygon tool (POLYGON_DATA::: string).
+        country: Country name from get_country_for_area tool.
+        categories: Category to filter by (e.g., 'restaurant', 'cafe', 'pharmacy').
+
+    Returns:
+        FILTERED_DATA:::JSON + human-readable list of matching places.
+    """
+    if not PLACEMAKING_API_URL:
+        return "Placemaking API URL is not configured."
+
+    try:
+        # Step 1: Extract polygon
+        json_str = polygon_geojson
+        if "POLYGON_DATA:::" in polygon_geojson:
+            json_str = polygon_geojson.split("POLYGON_DATA:::", 1)[1].strip()
+
+        poly_data = json.loads(json_str)
+        if poly_data.get("type") != "FeatureCollection":
+            poly_data = {
+                "type": "FeatureCollection",
+                "features": [{"type": "Feature", "properties": {}, "geometry": poly_data}]
+            }
+
+        # Step 2: Fetch POIs from Placemaking API
+        payload = {"country": country, "polygon": poly_data}
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+        with httpx.Client(timeout=300.0, headers=headers) as client:
+            resp = client.post(PLACEMAKING_API_URL, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        result_wrapper = data.get("result", {})
+        if isinstance(result_wrapper, dict):
+            results = result_wrapper.get("result", [])
+        else:
+            results = result_wrapper if isinstance(result_wrapper, list) else []
+
+        if not results:
+            return "No places found within this polygon in the live data."
+
+        results = results[:300]
+
+        # Step 3: Filter using LLM (batched, no agent round-trip)
+        try:
+            from langchain_openai import ChatOpenAI
+            from src.core.settings import OPENROUTER_API_KEY, OPENROUTER_BASE_URL
+
+            if not OPENROUTER_API_KEY:
+                raise ValueError("No API key")
+
+            BATCH_SIZE = 50
+            filtered_results = []
+
+            llm = ChatOpenAI(
+                model="openrouter/auto",
+                api_key=OPENROUTER_API_KEY,
+                base_url=OPENROUTER_BASE_URL,
+                temperature=0,
+            )
+
+            for batch_start in range(0, len(results), BATCH_SIZE):
+                batch = results[batch_start:batch_start + BATCH_SIZE]
+
+                places_summary = [
+                    {
+                        "index": i,
+                        "name": p.get("name", "Unknown"),
+                        "business_category": p.get("business_category", "N/A"),
+                        "main_category": p.get("main_category", "N/A"),
+                    }
+                    for i, p in enumerate(batch)
+                ]
+
+                llm_prompt = f"""You are a place filtering assistant. Analyze POI places and find semantic matches.
+
+User category query: "{categories}"
+
+Places to analyze:
+{json.dumps(places_summary, indent=2)}
+
+MATCHING RULES (use broad semantic understanding — err on the side of inclusion):
+- "restaurant/restoran/yemek/food": Match ANY place related to eating/dining: restaurants, lokanta, bistro, fast food, kebab, pizza, burger, döner, pide, lahmacun, köfte, balık evi, meze, ocakbaşı, mangal, izgara, çorba, börek, simit, pastane, fırın, hazır yemek, yemek fabrikası, catering, Full-Service Restaurants, Limited-Service Restaurants, Snack and Nonalcoholic Beverage Bars, Special Food Services, Food Service Contractors. Also match by NAME if it sounds like a restaurant (e.g., "Kebapçı", "Pide Salonu", "Lokanta", "Restoran").
+- "cafe/coffee/kahve": Match "Cafe", "Coffee", "Kahve", "Tea House", "Pastry", "Bakery", "Fırın"
+- "bar/pub/meyhane": Match "Bar", "Pub", "Meyhane", "Nightlife", "Birahane"
+- "market/supermarket": Match "Grocery", "Supermarket", "Market", "Food & Beverage Stores"
+- "pharmacy/eczane": Match "Pharmacy", "Eczane", "Drug Store"
+- For ANY food/dining query: be INCLUSIVE — if unsure whether a place serves food, include it
+
+IMPORTANT: If the query is about restaurants/food, include ALL food-related places.
+
+Return ONLY valid JSON:
+{{"filtered_indices": [0, 1, 3], "reasoning": "Matched places with restaurant categories"}}"""
+
+                try:
+                    response = llm.invoke(llm_prompt)
+                    llm_response = response.content.strip()
+                    if llm_response.startswith("```"):
+                        llm_response = re.sub(r"^```[a-zA-Z]*\n?", "", llm_response)
+                        llm_response = re.sub(r"\n?```$", "", llm_response).strip()
+                    parsed = json.loads(llm_response)
+                    filtered_indices = parsed.get("filtered_indices", [])
+                except Exception:
+                    filtered_indices = _fallback_pattern_filter(batch, categories)
+
+                for idx in filtered_indices:
+                    if 0 <= idx < len(batch):
+                        filtered_results.append(batch[idx])
+
+            if not filtered_results:
+                filtered_results = results
+
+        except Exception:
+            # If LLM filtering fails entirely, return all results
+            filtered_results = results
+
+        # Step 4: Format output
+        json_output = json.dumps(filtered_results)
+        output_lines = [f"Found {len(filtered_results)} places matching '{categories}':\n"]
+        for i, place in enumerate(filtered_results[:50], 1):
+            name = place.get("name", "Unknown")
+            lat = place.get("latitude")
+            lon = place.get("longitude")
+            address = place.get("street_address", "No address")
+            business_cat = place.get("business_category", "N/A")
+            city = place.get("city", "N/A")
+            output_lines.append(
+                f"{i}. {name}\n"
+                f"   📍 {lat}, {lon}\n"
+                f"   🏠 {address} - {city}\n"
+                f"   🧭 {business_cat}\n"
+            )
+        if len(filtered_results) > 50:
+            output_lines.append(f"\n... and {len(filtered_results) - 50} more places.")
+
+        return f"FILTERED_DATA:::{json_output}\n\n{''.join(output_lines)}"
+
+    except json.JSONDecodeError as e:
+        return f"Error parsing polygon JSON: {str(e)}"
+    except httpx.HTTPStatusError as e:
+        try:
+            error_detail = e.response.json().get("message", e.response.text[:500])
+        except Exception:
+            error_detail = e.response.text[:500]
+        return f"Placemaking API error {e.response.status_code}: {error_detail}"
+    except httpx.TimeoutException as e:
+        return f"Request timeout: {str(e)}"
+    except Exception as e:
+        return f"Error in search_and_filter_places: {str(e)}"
 
 
 @tool
@@ -509,7 +794,7 @@ def get_area_polygon(area_name: str) -> str:
         name = best_match.get("display_name", area_name)
         geojson = best_match.get("geojson")
         
-        return f"Polygon found for {name}: {json.dumps(geojson)}"
+        return f"POLYGON_DATA:::{json.dumps(geojson)}"
 
     except Exception as e:
         return f"Error fetching polygon: {str(e)}"
